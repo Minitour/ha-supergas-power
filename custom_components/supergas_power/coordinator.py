@@ -6,6 +6,7 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
@@ -47,6 +48,7 @@ class SupergasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._cold_retry = timedelta(minutes=COLD_START_RETRY_MINUTES)
 
         self._client = SupergasClient(
+            async_get_clientsession(hass),
             logistic=entry.data[CONF_LOGISTIC_NUMBER],
             phone=entry.data[CONF_PHONE],
         )
@@ -60,13 +62,11 @@ class SupergasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_data(self) -> dict[str, Any]:
         # Deliberately never raises on a throttle/no-data response. Setup must
-        # not hard-fail, because HA would then retry rapidly and keep the
-        # per-IP rate limit tripped. Instead we load (possibly empty) and back
-        # off: a short retry while we have never seen data, the full interval
-        # once we do.
+        # not hard-fail, so we load (possibly empty) and back off: a short retry
+        # while we have never seen data, the full interval once we do.
         _LOGGER.debug("Coordinator update starting")
         try:
-            data = await self.hass.async_add_executor_job(self._client.fetch)
+            data = await self._client.fetch()
         except SupergasThrottledError as err:
             if _has_data(self.data):
                 self.update_interval = self._full_interval

@@ -5,6 +5,7 @@ from typing import Any
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
     CONF_LOGISTIC_NUMBER,
@@ -30,11 +31,13 @@ class SupergasConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             await self.async_set_unique_id(f"{DOMAIN}_{logistic}")
             self._abort_if_unique_id_configured()
 
-            client = SupergasClient(logistic, phone)
+            client = SupergasClient(
+                async_get_clientsession(self.hass), logistic, phone
+            )
             try:
                 # Reachability only — a wrong phone cannot be distinguished
                 # from a throttle/bot-block, so we don't validate it here.
-                await self.hass.async_add_executor_job(client.check_reachable)
+                await client.check_reachable()
             except SupergasApiError:
                 errors["base"] = "cannot_connect"
             except Exception:  # noqa: BLE001
