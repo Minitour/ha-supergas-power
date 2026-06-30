@@ -99,6 +99,23 @@ Polling is kept gentle regardless:
 
 Avoid setting a very short interval or reloading the integration repeatedly.
 
+## Debugging
+
+If the sensor stays empty, enable debug logging to see exactly what the
+endpoint returns (HTTP status, whether the Aura context was found, each Apex
+method's result, and a snippet of the raw response on an empty/blocked reply).
+Add this to your `configuration.yaml` and restart:
+
+```yaml
+logger:
+  default: info
+  logs:
+    custom_components.supergas_power: debug
+```
+
+Then watch **Settings → System → Logs** (or `home-assistant.log`). The
+logistic number and phone are masked in the logs.
+
 ## Notes
 
 - This is an unofficial integration and is not affiliated with or endorsed by

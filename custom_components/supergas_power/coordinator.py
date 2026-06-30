@@ -64,24 +64,33 @@ class SupergasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # per-IP rate limit tripped. Instead we load (possibly empty) and back
         # off: a short retry while we have never seen data, the full interval
         # once we do.
+        _LOGGER.debug("Coordinator update starting")
         try:
             data = await self.hass.async_add_executor_job(self._client.fetch)
         except SupergasThrottledError as err:
             if _has_data(self.data):
                 self.update_interval = self._full_interval
-                _LOGGER.debug("Throttled (%s); keeping previous data", err)
+                _LOGGER.warning(
+                    "Throttled (%s); keeping previous data, next poll in %s",
+                    err, self._full_interval,
+                )
                 return self.data
             self.update_interval = self._cold_retry
             _LOGGER.warning(
-                "Supergas returned no invoice data yet (rate-limited, or the "
-                "logistic/phone could not be matched). Will retry in %s.",
-                self._cold_retry,
+                "Supergas returned no invoice data yet (bot-blocked/throttled, or "
+                "the logistic/phone could not be matched). Will retry in %s. (%s)",
+                self._cold_retry, err,
             )
             return _EMPTY
         except SupergasApiError as err:
             # Genuine transport/framework errors are transient — let the
             # coordinator surface them and retry on schedule.
+            _LOGGER.error("Supergas API error: %s", err)
             raise UpdateFailed(str(err)) from err
 
         self.update_interval = self._full_interval
+        _LOGGER.debug(
+            "Coordinator update ok: %d invoices, next poll in %s",
+            len(data.get("invoices") or []), self._full_interval,
+        )
         return data

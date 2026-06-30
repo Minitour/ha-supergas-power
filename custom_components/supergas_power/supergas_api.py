@@ -15,11 +15,24 @@ to be run inside Home Assistant's executor (see the coordinator).
 from __future__ import annotations
 
 import json
+import logging
 import re
 import urllib.parse
 from typing import Any
 
+import curl_cffi
 from curl_cffi import requests as cffi_requests
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _mask(value: str) -> str:
+    """Mask a logistic/phone for logs: keep first 3 and last 2 digits."""
+    if not value:
+        return "<empty>"
+    if len(value) <= 5:
+        return value[0] + "***"
+    return f"{value[:3]}***{value[-2:]}"
 
 # curl_cffi moved its exception locations between releases; stay version-robust.
 try:  # pragma: no cover - import shim
@@ -113,15 +126,20 @@ class SupergasClient:
 
     def _get_aura_context(self, session: "cffi_requests.Session") -> dict:
         """Scrape the rotating ``fwuid``/``loaded`` build pins from the page."""
+        url = ORIGIN + self._page_uri
+        _LOGGER.debug("GET aura context: %s (logistic=%s)", url, _mask(self._logistic))
         try:
-            resp = session.get(
-                ORIGIN + self._page_uri,
-                headers={"Accept-Language": "he-IL,he;q=0.9"},
-            )
-            resp.raise_for_status()
+            resp = session.get(url, headers={"Accept-Language": "he-IL,he;q=0.9"})
+            status = resp.status_code
             html = resp.text
         except _HttpError as err:
+            _LOGGER.error("GET page failed: %r", err)
             raise SupergasApiError(f"Failed to load page: {err}") from err
+
+        _LOGGER.debug("GET page -> HTTP %s, %d bytes", status, len(html))
+        if status >= 400:
+            _LOGGER.warning("GET page returned HTTP %s; snippet: %s", status, html[:300])
+            raise SupergasApiError(f"Page load returned HTTP {status}")
 
         for match in re.finditer(r"/s/sfsites/l/([^/\"'>\s]+)/", html):
             try:
@@ -129,11 +147,20 @@ class SupergasClient:
             except ValueError:
                 continue
             if blob.get("fwuid") and blob.get("loaded"):
-                return {
+                ctx = {
                     "fwuid": blob["fwuid"],
                     "app": blob.get("app", "siteforce:communityApp"),
                     "loaded": blob["loaded"],
                 }
+                _LOGGER.debug(
+                    "Aura context found: fwuid=%s app=%s loaded=%s",
+                    ctx["fwuid"], ctx["app"], ctx["loaded"],
+                )
+                return ctx
+        _LOGGER.warning(
+            "Aura context (fwuid/loaded) not found in page. HTML snippet: %s",
+            html[:400],
+        )
         raise SupergasApiError("Could not extract Aura context (fwuid/loaded)")
 
     def _call_apex_batch(
@@ -163,6 +190,7 @@ class SupergasClient:
             "aura.pageURI": self._page_uri,
             "aura.token": "null",
         }
+        _LOGGER.debug("POST apex methods=%s", [m for m, _ in calls])
         try:
             resp = session.post(
                 ORIGIN + AURA_PATH,
@@ -173,14 +201,25 @@ class SupergasClient:
                     "Referer": ORIGIN + self._page_uri,
                 },
             )
-            resp.raise_for_status()
+            status = resp.status_code
             text = resp.text
         except _HttpError as err:
+            _LOGGER.error("POST apex failed: %r", err)
             raise SupergasApiError(f"Apex request failed: {err}") from err
+
+        _LOGGER.debug("POST apex -> HTTP %s, %d bytes", status, len(text))
+        if status >= 400:
+            _LOGGER.warning("POST apex returned HTTP %s; snippet: %s", status, text[:400])
+            raise SupergasApiError(f"Apex request returned HTTP {status}")
 
         try:
             payload = json.loads(text)
         except ValueError as err:
+            _LOGGER.warning(
+                "Apex response was not JSON (stale fwuid / clientOutOfSync?). "
+                "Snippet: %s",
+                text[:400],
+            )
             raise SupergasApiError(
                 "Non-JSON response (likely stale fwuid / aura:clientOutOfSync)"
             ) from err
@@ -191,18 +230,35 @@ class SupergasClient:
         for i, (method, _params) in enumerate(calls, start=1):
             action = by_id.get(f"{i};a")
             if action is None:
+                _LOGGER.warning("No response entry for action %s", method)
                 raise SupergasApiError(f"No response for action {method}")
-            if action.get("state") != "SUCCESS":
+            state = action.get("state")
+            if state != "SUCCESS":
+                _LOGGER.warning(
+                    "Apex method %s state=%s error=%s", method, state, action.get("error")
+                )
                 raise SupergasApiError(
                     f"Apex error in {method}: {action.get('error')}"
                 )
             rv = action.get("returnValue")
             inner = rv.get("returnValue") if isinstance(rv, dict) else rv
+            kind = (
+                f"list[{len(inner)}]" if isinstance(inner, list)
+                else "null" if inner is None
+                else type(inner).__name__
+            )
+            _LOGGER.debug("Apex method %s -> state=%s, returnValue=%s", method, state, kind)
             if inner is None and method in _REQUIRED_METHODS:
                 throttled.append(method)
             results.append(inner)
 
         if throttled:
+            _LOGGER.warning(
+                "Required method(s) %s returned null (bot-blocked/throttled, or "
+                "logistic/phone not matched). Raw response (truncated): %s",
+                throttled,
+                text[:800],
+            )
             raise SupergasThrottledError(
                 "No data for " + ", ".join(throttled) + " (bot-blocked / throttled)"
             )
@@ -213,6 +269,11 @@ class SupergasClient:
 
         Blocking — call via ``hass.async_add_executor_job``.
         """
+        _LOGGER.debug(
+            "Fetch start: logistic=%s phone=%s (curl_cffi %s, impersonate=%s)",
+            _mask(self._logistic), _mask(self._phone),
+            getattr(curl_cffi, "__version__", "?"), IMPERSONATE,
+        )
         with self._new_session() as session:
             ctx = self._get_aura_context(session)
             calls = [
@@ -241,14 +302,23 @@ class SupergasClient:
             account, eligibility, invoices = self._call_apex_batch(session, ctx, calls)
 
         invoices = invoices or []
+        latest = select_latest_invoice(invoices)
+        _LOGGER.debug(
+            "Fetch done: account=%s eligibility=%s invoices=%d latest_amount=%s",
+            "present" if account else "none",
+            eligibility,
+            len(invoices),
+            (latest or {}).get("INVOICE_AMOUNT") if latest else None,
+        )
         return {
             "account": account,
             "eligibility": eligibility,
             "invoices": invoices,
-            "latest_invoice": select_latest_invoice(invoices),
+            "latest_invoice": latest,
         }
 
     def check_reachable(self) -> None:
         """Lightweight connectivity check for the config flow (blocking)."""
+        _LOGGER.debug("Reachability check (logistic=%s)", _mask(self._logistic))
         with self._new_session() as session:
             self._get_aura_context(session)
