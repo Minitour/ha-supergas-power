@@ -10,6 +10,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
+    COLD_START_RETRY_MINUTES,
     CONF_LOGISTIC_NUMBER,
     CONF_PHONE,
     CONF_SCAN_INTERVAL_HOURS,
@@ -19,6 +20,17 @@ from .const import (
 from .supergas_api import SupergasApiError, SupergasClient, SupergasThrottledError
 
 _LOGGER = logging.getLogger(__name__)
+
+_EMPTY: dict[str, Any] = {
+    "account": None,
+    "eligibility": None,
+    "invoices": [],
+    "latest_invoice": None,
+}
+
+
+def _has_data(data: dict[str, Any] | None) -> bool:
+    return bool(data and data.get("invoices"))
 
 
 class SupergasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -32,6 +44,8 @@ class SupergasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 entry.data.get(CONF_SCAN_INTERVAL_HOURS, DEFAULT_SCAN_INTERVAL_HOURS),
             )
         )
+        self._full_interval = timedelta(hours=max(1, hours))
+        self._cold_retry = timedelta(minutes=COLD_START_RETRY_MINUTES)
 
         session = async_get_clientsession(hass)
         self._client = SupergasClient(
@@ -44,21 +58,33 @@ class SupergasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hass,
             logger=_LOGGER,
             name=DOMAIN,
-            update_interval=timedelta(hours=max(1, hours)),
+            update_interval=self._full_interval,
         )
 
     async def _async_update_data(self) -> dict[str, Any]:
+        # Deliberately never raises on a throttle/no-data response. Setup must
+        # not hard-fail, because HA would then retry rapidly and keep the
+        # per-IP rate limit tripped. Instead we load (possibly empty) and back
+        # off: a short retry while we have never seen data, the full interval
+        # once we do.
         try:
-            return await self._client.async_fetch()
+            data = await self._client.async_fetch()
         except SupergasThrottledError as err:
-            # The endpoint silently withholds data once the per-IP quota is
-            # spent. Keep the last known value rather than going unavailable.
-            if self.data is not None:
-                _LOGGER.debug("Supergas throttled (%s); keeping previous data", err)
+            if _has_data(self.data):
+                self.update_interval = self._full_interval
+                _LOGGER.debug("Throttled (%s); keeping previous data", err)
                 return self.data
-            raise UpdateFailed(
-                "Supergas endpoint returned no data (rate-limited). It will "
-                "retry on the next scheduled update."
-            ) from err
+            self.update_interval = self._cold_retry
+            _LOGGER.warning(
+                "Supergas returned no invoice data yet (rate-limited, or the "
+                "logistic/phone could not be matched). Will retry in %s.",
+                self._cold_retry,
+            )
+            return _EMPTY
         except SupergasApiError as err:
+            # Genuine transport/framework errors are transient — let the
+            # coordinator surface them and retry on schedule.
             raise UpdateFailed(str(err)) from err
+
+        self.update_interval = self._full_interval
+        return data

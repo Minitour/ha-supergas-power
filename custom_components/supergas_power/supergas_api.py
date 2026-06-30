@@ -26,9 +26,11 @@ from aiohttp import ClientError, ClientSession
 ORIGIN = "https://sfselfservice.supergas-power.co.il"
 AURA_PATH = "/s/sfsites/aura?r=1&aura.ApexAction.execute=1"
 
-# Apex methods whose null payload indicates the per-IP throttle (they carry
-# PII); the routing helper legitimately returns short strings.
-_PII_METHODS = ("getServiceAccount", "getCustomerInvoices")
+# Only the invoice list is required for the sensor. Its null payload is the
+# signal that the endpoint is withholding data (per-IP rate limit, or details
+# that could not be matched). ``getServiceAccount`` is auxiliary — a null there
+# is tolerated and must not fail the whole fetch.
+_REQUIRED_METHODS = ("getCustomerInvoices",)
 
 STATUS_EN = {
     "שולם": "Paid",
@@ -190,7 +192,7 @@ class SupergasClient:
                 )
             rv = action.get("returnValue")
             inner = rv.get("returnValue") if isinstance(rv, dict) else rv
-            if inner is None and method in _PII_METHODS:
+            if inner is None and method in _REQUIRED_METHODS:
                 throttled.append(method)
             results.append(inner)
 

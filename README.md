@@ -85,9 +85,14 @@ budget the integration:
 - keeps the **last known value** when it is temporarily throttled, instead of
   dropping the sensor to *unavailable*.
 
-Pick a long update interval and avoid reloading the integration repeatedly. If
-the sensor is unavailable right after setup, wait for the next scheduled
-update.
+Pick a long update interval and avoid reloading the integration repeatedly.
+
+Because of this, setup is designed to **never hard-fail**: the integration is
+added immediately and the sensor simply reports *unknown* until the first
+successful fetch. While it has never seen data it retries roughly every 30
+minutes; once it has data it switches to your configured interval. So right
+after adding it, give it a little time to populate (it can take up to that
+first retry, or longer if the endpoint is actively rate-limiting your IP).
 
 ## Notes
 
