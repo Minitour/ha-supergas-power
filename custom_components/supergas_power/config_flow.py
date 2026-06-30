@@ -67,12 +67,12 @@ class SupergasConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     @staticmethod
     @callback
     def async_get_options_flow(config_entry):
-        return SupergasOptionsFlow(config_entry)
+        return SupergasOptionsFlow()
 
 
 class SupergasOptionsFlow(config_entries.OptionsFlow):
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        self.config_entry = config_entry
+    # `config_entry` is provided automatically by Home Assistant as a
+    # read-only property; do not set it manually.
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None):
         if user_input is not None:
