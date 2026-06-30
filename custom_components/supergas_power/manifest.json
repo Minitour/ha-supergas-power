@@ -1,0 +1,11 @@
+{
+  "domain": "supergas_power",
+  "name": "Supergas Power",
+  "codeowners": ["@Minitour"],
+  "config_flow": true,
+  "documentation": "https://github.com/Minitour/ha-supergas-power",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/Minitour/ha-supergas-power/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

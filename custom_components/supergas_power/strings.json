@@ -1,0 +1,32 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Supergas Power",
+        "description": "Enter the 9-digit customer/logistic number printed on your gas invoice and the phone number on the account.",
+        "data": {
+          "logistic_number": "Logistic number",
+          "phone": "Phone number",
+          "scan_interval_hours": "Update interval (hours)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not reach the Supergas Power service",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "This account is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Supergas Power settings",
+        "data": {
+          "scan_interval_hours": "Update interval (hours)"
+        }
+      }
+    }
+  }
+}
