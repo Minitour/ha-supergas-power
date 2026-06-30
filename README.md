@@ -73,26 +73,31 @@ list, then derives the most recent invoice from that list.
   | `net_amount` | Pre-VAT amount |
   | `vat_amount` | VAT portion |
 
-## Polling & rate limits
+## Bot protection & polling
 
-The upstream data endpoints are **rate-limited per source IP**: once a small
-per-window quota is spent, they silently return no data. To stay within that
-budget the integration:
+The upstream endpoint sits behind bot protection that fingerprints the
+TLS/HTTP2 handshake: a real browser receives data, while an ordinary Python
+HTTP client (`requests`/`aiohttp`) gets an empty (`null`) response. This is
+**not** IP rate-limiting and not a request-shape problem.
 
-- polls slowly (default **every 12 hours** — invoices change at most once per
-  billing cycle), and
-- sends the whole flow as a **single request** per poll, and
-- keeps the **last known value** when it is temporarily throttled, instead of
-  dropping the sensor to *unavailable*.
+To get past it the integration uses [`curl_cffi`](https://github.com/lexiforest/curl_cffi)
+to **impersonate Chrome's TLS/HTTP2 fingerprint**, which makes the request
+look like a genuine browser. `curl_cffi` is declared as a requirement and is
+installed automatically by Home Assistant. Prebuilt wheels exist for the
+common Home Assistant platforms (x86-64 and aarch64); very old 32-bit ARM
+hosts may not have a wheel.
 
-Pick a long update interval and avoid reloading the integration repeatedly.
+Polling is kept gentle regardless:
 
-Because of this, setup is designed to **never hard-fail**: the integration is
-added immediately and the sensor simply reports *unknown* until the first
-successful fetch. While it has never seen data it retries roughly every 30
-minutes; once it has data it switches to your configured interval. So right
-after adding it, give it a little time to populate (it can take up to that
-first retry, or longer if the endpoint is actively rate-limiting your IP).
+- it polls slowly (default **every 12 hours** — invoices change at most once
+  per billing cycle), and sends the whole flow as a single batched request;
+- setup **never hard-fails**: the integration is added immediately and the
+  sensor reports *unknown* until the first successful fetch. While it has never
+  seen data it retries roughly every 30 minutes; once it has data it switches
+  to your configured interval and keeps the last known value if a later poll
+  comes back empty.
+
+Avoid setting a very short interval or reloading the integration repeatedly.
 
 ## Notes
 

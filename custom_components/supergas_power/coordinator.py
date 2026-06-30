@@ -6,7 +6,6 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
@@ -47,9 +46,7 @@ class SupergasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._full_interval = timedelta(hours=max(1, hours))
         self._cold_retry = timedelta(minutes=COLD_START_RETRY_MINUTES)
 
-        session = async_get_clientsession(hass)
         self._client = SupergasClient(
-            session=session,
             logistic=entry.data[CONF_LOGISTIC_NUMBER],
             phone=entry.data[CONF_PHONE],
         )
@@ -68,7 +65,7 @@ class SupergasCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # off: a short retry while we have never seen data, the full interval
         # once we do.
         try:
-            data = await self._client.async_fetch()
+            data = await self.hass.async_add_executor_job(self._client.fetch)
         except SupergasThrottledError as err:
             if _has_data(self.data):
                 self.update_interval = self._full_interval

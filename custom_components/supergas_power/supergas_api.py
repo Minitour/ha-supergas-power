@@ -1,17 +1,15 @@
-"""Async client for the Supergas Power self-service (Salesforce Aura) API.
+"""Client for the Supergas Power self-service (Salesforce Aura) API.
 
-This is an asyncio/aiohttp port of the standalone reference client. It talks
-to the guest Salesforce Experience Cloud endpoint that backs the
-invoice-payment page and returns the customer's invoice list.
+The endpoint sits behind bot protection that fingerprints the TLS/HTTP2
+handshake: a real browser gets data, while a plain ``requests``/``aiohttp``
+client receives ``state == "SUCCESS"`` with a ``null`` payload (it is *not*
+IP rate-limiting and *not* a request-shape issue — verified by getting data
+from a real browser and from ``curl_cffi`` at the same instant a vanilla
+client was being nulled).
 
-Notes on the 2026 hardening (see repository README):
-* ``getServiceAccount`` and ``getCustomerInvoices`` are rate-limited per
-  source IP. Once the small per-window quota is spent they return
-  ``state == "SUCCESS"`` with a ``null`` payload. That is surfaced here as
-  :class:`SupergasThrottledError` so the coordinator can keep the last known
-  value instead of crashing.
-* The whole flow is sent as a single batched POST to be gentle on that quota.
-* Never enumerate logistic numbers other than your own.
+We therefore use :mod:`curl_cffi`, which impersonates Chrome's real TLS/HTTP2
+fingerprint, to defeat that detection. The client is synchronous and is meant
+to be run inside Home Assistant's executor (see the coordinator).
 """
 
 from __future__ import annotations
@@ -21,15 +19,25 @@ import re
 import urllib.parse
 from typing import Any
 
-from aiohttp import ClientError, ClientSession
+from curl_cffi import requests as cffi_requests
+
+# curl_cffi moved its exception locations between releases; stay version-robust.
+try:  # pragma: no cover - import shim
+    from curl_cffi.requests.exceptions import RequestException as _HttpError
+except Exception:  # noqa: BLE001
+    try:  # pragma: no cover
+        from curl_cffi.requests.errors import RequestsError as _HttpError
+    except Exception:  # noqa: BLE001
+        _HttpError = Exception
 
 ORIGIN = "https://sfselfservice.supergas-power.co.il"
 AURA_PATH = "/s/sfsites/aura?r=1&aura.ApexAction.execute=1"
 
-# Only the invoice list is required for the sensor. Its null payload is the
-# signal that the endpoint is withholding data (per-IP rate limit, or details
-# that could not be matched). ``getServiceAccount`` is auxiliary — a null there
-# is tolerated and must not fail the whole fetch.
+# Browser profile for curl_cffi to impersonate (TLS + HTTP2 fingerprint).
+IMPERSONATE = "chrome"
+
+# Only the invoice list is required for the sensor. ``getServiceAccount`` is
+# auxiliary, so a null there must not fail the whole fetch.
 _REQUIRED_METHODS = ("getCustomerInvoices",)
 
 STATUS_EN = {
@@ -44,7 +52,7 @@ class SupergasApiError(Exception):
 
 
 class SupergasThrottledError(SupergasApiError):
-    """A PII method returned SUCCESS-but-null (per-IP rate limit)."""
+    """A required method returned SUCCESS-but-null (bot-blocked / throttled)."""
 
 
 def _apex_action(action_id: str, method: str, params: dict) -> dict:
@@ -73,12 +81,7 @@ def _invoice_filters(logistic: str) -> list[dict]:
 
 
 def select_latest_invoice(invoices: list[dict]) -> dict | None:
-    """Return the most recent invoice.
-
-    Ordered by billing date (``EVENT_DATE``, ``YYYY-MM-DD`` so it sorts
-    lexicographically) and then by the monotonically increasing invoice
-    number as a tie-breaker.
-    """
+    """Return the most recent invoice (latest billing date, then number)."""
     if not invoices:
         return None
 
@@ -94,28 +97,30 @@ def select_latest_invoice(invoices: list[dict]) -> dict | None:
 
 
 class SupergasClient:
-    """Minimal async client around the guest invoice endpoint."""
+    """Synchronous client around the guest invoice endpoint.
 
-    def __init__(self, session: ClientSession, logistic: str, phone: str) -> None:
-        self._session = session
+    Run its blocking methods (:meth:`fetch`, :meth:`check_reachable`) inside an
+    executor from Home Assistant.
+    """
+
+    def __init__(self, logistic: str, phone: str) -> None:
         self._logistic = logistic
         self._phone = phone
         self._page_uri = f"/s/invoice-payment?logisticNumber={logistic}"
 
-    async def _get_aura_context(self) -> dict:
+    def _new_session(self) -> "cffi_requests.Session":
+        return cffi_requests.Session(impersonate=IMPERSONATE, timeout=30)
+
+    def _get_aura_context(self, session: "cffi_requests.Session") -> dict:
         """Scrape the rotating ``fwuid``/``loaded`` build pins from the page."""
         try:
-            async with self._session.get(
+            resp = session.get(
                 ORIGIN + self._page_uri,
-                headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "Accept-Language": "he-IL,he;q=0.9",
-                },
-                timeout=30,
-            ) as resp:
-                resp.raise_for_status()
-                html = await resp.text()
-        except ClientError as err:
+                headers={"Accept-Language": "he-IL,he;q=0.9"},
+            )
+            resp.raise_for_status()
+            html = resp.text
+        except _HttpError as err:
             raise SupergasApiError(f"Failed to load page: {err}") from err
 
         for match in re.finditer(r"/s/sfsites/l/([^/\"'>\s]+)/", html):
@@ -131,8 +136,11 @@ class SupergasClient:
                 }
         raise SupergasApiError("Could not extract Aura context (fwuid/loaded)")
 
-    async def _call_apex_batch(
-        self, ctx: dict, calls: list[tuple[str, dict]]
+    def _call_apex_batch(
+        self,
+        session: "cffi_requests.Session",
+        ctx: dict,
+        calls: list[tuple[str, dict]],
     ) -> list[Any]:
         actions = [
             _apex_action(f"{i};a", method, params)
@@ -156,20 +164,18 @@ class SupergasClient:
             "aura.token": "null",
         }
         try:
-            async with self._session.post(
+            resp = session.post(
                 ORIGIN + AURA_PATH,
                 data=body,
                 headers={
                     "Content-Type": "application/x-www-form-urlencoded",
-                    "User-Agent": "Mozilla/5.0",
                     "Origin": ORIGIN,
                     "Referer": ORIGIN + self._page_uri,
                 },
-                timeout=30,
-            ) as resp:
-                resp.raise_for_status()
-                text = await resp.text()
-        except ClientError as err:
+            )
+            resp.raise_for_status()
+            text = resp.text
+        except _HttpError as err:
             raise SupergasApiError(f"Apex request failed: {err}") from err
 
         try:
@@ -198,42 +204,42 @@ class SupergasClient:
 
         if throttled:
             raise SupergasThrottledError(
-                "No data for " + ", ".join(throttled) + " (per-IP rate limit)"
+                "No data for " + ", ".join(throttled) + " (bot-blocked / throttled)"
             )
         return results
 
-    async def async_fetch(self) -> dict[str, Any]:
+    def fetch(self) -> dict[str, Any]:
         """Fetch account, eligibility and invoices in one round-trip.
 
-        Returns a dict with ``account``, ``eligibility``, ``invoices`` and the
-        derived ``latest_invoice``. Raises :class:`SupergasThrottledError` when
-        the endpoint silently withholds data.
+        Blocking — call via ``hass.async_add_executor_job``.
         """
-        ctx = await self._get_aura_context()
-        calls = [
-            (
-                "getServiceAccount",
-                {
-                    "logisticNumber": self._logistic,
-                    "invoiceNumber": self._logistic,
-                    "phone": self._phone,
-                },
-            ),
-            (
-                "canAccProcessInvoices",
-                {"logisticNumber": self._logistic, "maaleSS": ""},
-            ),
-            (
-                "getCustomerInvoices",
-                {
-                    "logisticNumber": self._logistic,
-                    "optionalParams": json.dumps(
-                        _invoice_filters(self._logistic), ensure_ascii=False
-                    ),
-                },
-            ),
-        ]
-        account, eligibility, invoices = await self._call_apex_batch(ctx, calls)
+        with self._new_session() as session:
+            ctx = self._get_aura_context(session)
+            calls = [
+                (
+                    "getServiceAccount",
+                    {
+                        "logisticNumber": self._logistic,
+                        "invoiceNumber": self._logistic,
+                        "phone": self._phone,
+                    },
+                ),
+                (
+                    "canAccProcessInvoices",
+                    {"logisticNumber": self._logistic, "maaleSS": ""},
+                ),
+                (
+                    "getCustomerInvoices",
+                    {
+                        "logisticNumber": self._logistic,
+                        "optionalParams": json.dumps(
+                            _invoice_filters(self._logistic), ensure_ascii=False
+                        ),
+                    },
+                ),
+            ]
+            account, eligibility, invoices = self._call_apex_batch(session, ctx, calls)
+
         invoices = invoices or []
         return {
             "account": account,
@@ -242,11 +248,7 @@ class SupergasClient:
             "latest_invoice": select_latest_invoice(invoices),
         }
 
-    async def async_check_reachable(self) -> None:
-        """Lightweight connectivity check for the config flow.
-
-        Only confirms the site is reachable and the Aura context can be
-        scraped (no PII quota is consumed). It cannot validate the phone,
-        because a wrong phone is indistinguishable from the rate limit.
-        """
-        await self._get_aura_context()
+    def check_reachable(self) -> None:
+        """Lightweight connectivity check for the config flow (blocking)."""
+        with self._new_session() as session:
+            self._get_aura_context(session)

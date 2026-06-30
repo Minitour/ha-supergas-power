@@ -5,7 +5,6 @@ from typing import Any
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
     CONF_LOGISTIC_NUMBER,
@@ -31,12 +30,11 @@ class SupergasConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             await self.async_set_unique_id(f"{DOMAIN}_{logistic}")
             self._abort_if_unique_id_configured()
 
-            session = async_get_clientsession(self.hass)
-            client = SupergasClient(session, logistic, phone)
+            client = SupergasClient(logistic, phone)
             try:
-                # Reachability only — no PII quota is spent, and a wrong phone
-                # cannot be distinguished from the rate limit anyway.
-                await client.async_check_reachable()
+                # Reachability only — a wrong phone cannot be distinguished
+                # from a throttle/bot-block, so we don't validate it here.
+                await self.hass.async_add_executor_job(client.check_reachable)
             except SupergasApiError:
                 errors["base"] = "cannot_connect"
             except Exception:  # noqa: BLE001
